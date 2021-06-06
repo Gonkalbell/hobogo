@@ -1,17 +1,23 @@
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    fs::File,
+    io::{Read, Write},
+    time::{Duration, Instant},
+};
 
 use serde::{Deserialize, Serialize};
 
-use egui::{
-    color::{srgba, Srgba},
-    label,
-    math::*,
-    paint::TextStyle,
-    widgets::*,
-    Align, Painter, Ui,
+use eframe::{
+    egui::{self, color::Color32, math::*, paint::TextStyle, widgets::*, Align, Painter, Ui},
+    epi,
 };
 
-use crate::hobogo::{Board, Coord, Player};
+use crate::{
+    hobogo::{Board, Coord, Player},
+    mcts,
+};
+
+const STORAGE_FILE_NAME: &str = "hobogo.json";
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Serialize)]
 pub struct Settings {
@@ -19,6 +25,7 @@ pub struct Settings {
     num_humans: usize,
     num_bots: usize,
     humans_first: bool,
+    bot_think_time: f32,
 }
 
 impl Default for Settings {
@@ -28,6 +35,7 @@ impl Default for Settings {
             num_humans: 1,
             num_bots: 1,
             humans_first: true,
+            bot_think_time: 1.,
         }
     }
 }
@@ -64,8 +72,16 @@ impl State {
     }
 
     pub fn from_local_storage() -> Option<Self> {
+        #[cfg(target_arch = "wasm32")]
         let state: Option<State> =
             egui_web::local_storage_get("hobogo_state").map(|s| serde_json::from_str(&s).ok())?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let state: Option<State> = File::open(STORAGE_FILE_NAME).ok().and_then(|mut f| {
+            let mut buf = String::new();
+            f.read_to_string(&mut buf).ok()?;
+            serde_json::from_str(&buf).ok()
+        });
+
         if let Some(state) = state {
             if state.is_valid() {
                 return Some(state);
@@ -75,9 +91,22 @@ impl State {
     }
 
     pub fn save_to_local_storage(&self) -> bool {
-        serde_json::to_string(&self)
-            .map(|s| egui_web::local_storage_set("hobogo_state", &s))
-            .is_ok()
+        let json_string = serde_json::to_string(&self);
+        #[cfg(target_arch = "wasm32")]
+        {
+            json_string
+                .map(|s| egui_web::local_storage_set("hobogo_state", &s))
+                .is_ok()
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            json_string
+                .map(|s| {
+                    let mut f = File::create(STORAGE_FILE_NAME)?;
+                    write!(&mut f, "{}", s)
+                })
+                .is_ok()
+        }
     }
 
     pub fn new_or_restore() -> Self {
@@ -96,6 +125,25 @@ pub struct App {
     ai_frame_delay: usize,
 }
 
+impl epi::App for App {
+    fn update(&mut self, ctx: &eframe::egui::CtxRef, _frame: &mut eframe::epi::Frame<'_>) {
+        eframe::egui::CentralPanel::default().show(ctx, |ui| {
+            let width = (ui.max_rect().height() - 100.0) * 0.8; // This is a bit ugly
+            let width = width.min(ui.max_rect().width() - 22.0);
+            let x = ui.available_size().x / 2.0 - width / 2.0;
+            let mut ui = ui.child_ui(
+                Rect::from_min_size(pos2(x, 0.0), vec2(width, ui.available_size().y)),
+                *ui.layout(),
+            );
+            self.show_gui(&mut ui);
+        });
+    }
+
+    fn name(&self) -> &str {
+        "hobogo"
+    }
+}
+
 impl App {
     pub fn restore_or_new() -> Self {
         App {
@@ -106,26 +154,26 @@ impl App {
     }
 
     pub fn show_gui(&mut self, ui: &mut Ui) {
-        ui.with_layout(egui::Layout::vertical(Align::Center), |ui| {
-            ui.add(label!("HOBOGO").text_style(TextStyle::Heading));
+        ui.with_layout(egui::Layout::top_down(Align::Center), |ui| {
+            ui.add(Label::new("HOBOGO").text_style(TextStyle::Heading));
         });
         self.show_settings(ui);
 
-        ui.with_layout(egui::Layout::vertical(Align::Center), |ui| {
+        ui.with_layout(egui::Layout::top_down(Align::Center), |ui| {
             self.state.show_whos_next(ui);
         });
 
         self.show_board_and_interact(ui);
 
         ui.columns(2, |cols| {
-            if cols[0].add(Button::new("New Game")).clicked {
+            if cols[0].add(Button::new("New Game")).clicked() {
                 if !self.state.board.is_empty() {
                     self.undo_stack.push_back(self.state.clone());
                 }
                 self.state = State::new(self.state.settings);
                 self.state.save_to_local_storage();
             }
-            if !self.undo_stack.is_empty() && cols[0].add(Button::new("Undo")).clicked {
+            if !self.undo_stack.is_empty() && cols[0].add(Button::new("Undo")).clicked() {
                 self.state = self.undo_stack.pop_back().unwrap();
             }
             self.state.show_score(&mut cols[1]);
@@ -141,9 +189,11 @@ impl App {
 
         let mut settings = self.state.settings;
         ui.columns(2, |cols| {
-            cols[0].add(Slider::usize(&mut settings.num_humans, 0..=4).text("Humans"));
-            cols[0].add(Slider::usize(&mut settings.num_bots, 0..=4).text("Bots"));
-            cols[1].add(Slider::usize(&mut settings.board_size, 5..=17).text("Size"));
+            cols[0].add(Slider::new(&mut settings.num_humans, 0..=4).text("Humans"));
+            cols[0].add(Slider::new(&mut settings.num_bots, 0..=4).text("Bots"));
+            cols[0]
+                .add(Slider::new(&mut settings.bot_think_time, 0.01..=3.).text("Bot Think Time"));
+            cols[1].add(Slider::new(&mut settings.board_size, 5..=17).text("Size"));
             cols[1]
                 .checkbox(&mut settings.humans_first, "Humans go first")
                 .on_hover_text("Going first is a big advantage");
@@ -164,29 +214,28 @@ impl App {
 
     fn show_board_and_interact(&mut self, ui: &mut Ui) {
         // Add spacing before the board:
-        ui.advance_cursor(8.0);
+        ui.add_space(8.0);
 
         let size = ui.max_rect().width() - 32.0; // Leave space for row numbers
-        let rect = ui.allocate_space(vec2(size, size));
-        let board_id = ui.make_position_id();
+        let (board_id, rect) = ui.allocate_space(vec2(size, size));
         let board_interact = ui.interact(rect, board_id, egui::Sense::click());
 
         // HACK: Add some spacing for the column names
-        ui.advance_cursor(32.0);
+        ui.add_space(32.0);
 
         let state = &mut self.state;
 
         if !state.board.is_game_over(state.num_players()) {
             if state.next_player_is_human() {
-                if board_interact.hovered {
-                    if let Some(mouse_pos) = ui.input().mouse.pos {
+                if board_interact.hovered() {
+                    if let Some(mouse_pos) = ui.input().pointer.interact_pos() {
                         if let Some(hovered_coord) = hovered_coord(&state.board, &rect, mouse_pos) {
                             if state.board.is_valid_move(
                                 hovered_coord,
                                 state.next_player,
                                 state.num_players(),
                             ) {
-                                if board_interact.clicked {
+                                if board_interact.clicked() {
                                     self.undo_stack.push_back(state.clone());
                                     state.board[hovered_coord] = Some(state.next_player);
                                     state.next_player =
@@ -202,7 +251,7 @@ impl App {
                     }
                 }
             } else {
-                if ui.ctx().is_using_mouse() {
+                if ui.ctx().is_using_pointer() {
                     // Don't do anything slow while the user is e.g. dragging a slider
                 } else {
                     // This is slow. TODO: run in background thread... when wasm supports it.
@@ -213,9 +262,7 @@ impl App {
                     } else {
                         self.ai_frame_delay = 0;
 
-                        if let Some(coord) =
-                            state.board.ai_move(state.next_player, state.num_players())
-                        {
+                        if let Some(coord) = state.ai_move(state.next_player, state.num_players()) {
                             state.board[coord] = Some(state.next_player);
                         }
                         state.next_player = (state.next_player + 1) % (state.num_players() as u8);
@@ -232,14 +279,16 @@ impl App {
 impl State {
     pub fn show_whos_next(&mut self, ui: &mut Ui) {
         if self.board.is_game_over(self.num_players()) {
-            ui.add(label!("Game over!"));
+            ui.add(Label::new("Game over!"));
         } else {
             let player_color = player_color(self.next_player);
             let player_name = self.player_name(self.next_player);
             if self.next_player_is_human() {
-                ui.add(label!("{} to play", player_name).text_color(player_color));
+                ui.add(Label::new(format!("{} to play", player_name)).text_color(player_color));
             } else {
-                ui.add(label!("{} is thinking...", player_name).text_color(player_color));
+                ui.add(
+                    Label::new(format!("{} is thinking...", player_name)).text_color(player_color),
+                );
             }
         }
     }
@@ -250,8 +299,8 @@ impl State {
             for pi in 0..self.num_players() {
                 let player_color = player_color(pi as Player);
                 let player_name = self.player_name(pi as Player);
-                cols[0].add(label!("{}", player_name).text_color(player_color));
-                cols[1].add(label!("{}", score[pi]).text_color(player_color));
+                cols[0].add(Label::new(format!("{}", player_name)).text_color(player_color));
+                cols[1].add(Label::new(format!("{}", score[pi])).text_color(player_color));
             }
         });
 
@@ -339,13 +388,13 @@ impl State {
             }
         }
 
-        let text_color = srgba(100, 100, 100, 255);
+        let text_color = Color32::from_rgba_premultiplied(100, 100, 100, 255);
 
         // Name chess column names:
         for x in 0..board.width {
             painter.text(
                 rect.min + vec2((x as f32 + 0.5) * spacing, rect.height() + 12.0),
-                (Align::Center, Align::Min),
+                Align2::LEFT_CENTER,
                 &column_name(x),
                 TextStyle::Body,
                 text_color,
@@ -356,7 +405,7 @@ impl State {
         for y in 0..board.height {
             painter.text(
                 rect.min + vec2(rect.width() + 12.0, (y as f32 + 0.5) * spacing),
-                (Align::Min, Align::Center),
+                Align2::CENTER_BOTTOM,
                 &row_name(y),
                 TextStyle::Body,
                 text_color,
@@ -364,14 +413,19 @@ impl State {
         }
     }
 
-    fn cell_color(&self, c: Coord, is_volatile: bool) -> Srgba {
+    fn cell_color(&self, c: Coord, is_volatile: bool) -> Color32 {
         let influence = self.board.influence(c);
         if let Some(claimer) = influence.player() {
             let color = player_color(claimer);
             if is_volatile || influence.is_occupied() {
                 color
             } else {
-                srgba(color.r() / 2, color.g() / 2, color.b() / 2, color.a()) // Darker
+                Color32::from_rgba_premultiplied(
+                    color.r() / 2,
+                    color.g() / 2,
+                    color.b() / 2,
+                    color.a(),
+                ) // Darker
             }
         } else if self.next_player_is_human()
             && !self
@@ -379,24 +433,64 @@ impl State {
                 .is_valid_move(c, self.next_player, self.num_players())
         {
             // The currant human can't move here
-            srgba(90, 90, 100, 255)
+            Color32::from_rgba_premultiplied(90, 90, 100, 255)
         } else {
             // Free (at least for some)
-            srgba(150, 150, 160, 255)
+            Color32::from_rgba_premultiplied(150, 150, 160, 255)
+        }
+    }
+
+    pub fn ai_move(&self, player: Player, num_players: usize) -> Option<Coord> {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::SmallRng::from_entropy(); // Fast
+
+        let state = mcts::GameState {
+            next_player: player,
+            num_players,
+            board: self.board.clone(),
+        };
+
+        let think_time = self.settings.bot_think_time;
+        let mut mcts = mcts::Mcts::new(state);
+        #[cfg(target_arch = "wasm32")]
+        let start = egui_web::now_sec();
+        #[cfg(not(target_arch = "wasm32"))]
+        let start = Instant::now();
+        while {
+            mcts.iterate(&mut rng);
+            #[cfg(target_arch = "wasm32")]
+            {
+                egui_web::now_sec() - start < think_time as f64
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                Instant::now() - start < Duration::from_secs_f32(think_time)
+            }
+        } {}
+
+        let action = mcts.best_action().cloned();
+
+        if let Some(action) = action {
+            match action {
+                mcts::Action::Pass => None,
+                mcts::Action::Move(coord) => Some(coord),
+            }
+        } else {
+            None
         }
     }
 }
 
-fn player_color(player: Player) -> Srgba {
+fn player_color(player: Player) -> Color32 {
     match player {
-        // 0 => srgba(85, 119, 255, 255),
-        // 1 => srgba(205, 0, 0, 255),
-        // 2 => srgba(0, 255, 0, 255),
-        // _ => srgba(221, 221, 0, 255),
-        0 => srgba(239, 169, 0, 255),
-        1 => srgba(242, 73, 117, 255),
-        2 => srgba(31, 187, 171, 255),
-        _ => srgba(121, 68, 219, 255),
+        // 0 => Color32::from_rgba_premultiplied(85, 119, 255, 255),
+        // 1 => Color32::from_rgba_premultiplied(205, 0, 0, 255),
+        // 2 => Color32::from_rgba_premultiplied(0, 255, 0, 255),
+        // _ => Color32::from_rgba_premultiplied(221, 221, 0, 255),
+        0 => Color32::from_rgba_premultiplied(239, 169, 0, 255),
+        1 => Color32::from_rgba_premultiplied(242, 73, 117, 255),
+        2 => Color32::from_rgba_premultiplied(31, 187, 171, 255),
+        _ => Color32::from_rgba_premultiplied(121, 68, 219, 255),
     }
 }
 

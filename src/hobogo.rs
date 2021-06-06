@@ -2,17 +2,13 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use egui_web::now_sec;
-
-use crate::mcts;
-
 const MAX_PLAYERS: usize = 8;
 
 pub type Player = u8;
 
 pub type Cell = Option<Player>;
 
-fn player_from_i8(x: i8) -> Cell {
+fn _player_from_i8(x: i8) -> Cell {
     if x < 0 {
         None
     } else {
@@ -361,7 +357,7 @@ impl Board {
         num_players_with_valid_moves > 1
     }
 
-    fn everything_is_ruled_by_someone(&self) -> bool {
+    fn _everything_is_ruled_by_someone(&self) -> bool {
         self.coords()
             .map(|c| self.influence(c))
             .all(|influence| match influence {
@@ -372,7 +368,7 @@ impl Board {
             })
     }
 
-    fn one_player_has_unbeatable_lead(&self) -> bool {
+    fn _one_player_has_unbeatable_lead(&self) -> bool {
         let mut guaranteed_points = [0; MAX_PLAYERS];
         let mut contested = 0;
         for influence in self.coords().map(|c| self.influence(c)) {
@@ -455,36 +451,4 @@ impl Board {
     //         None
     //     }
     // }
-}
-
-impl Board {
-    pub fn ai_move(&self, player: Player, num_players: usize) -> Option<Coord> {
-        use rand::SeedableRng;
-        let mut rng = rand::rngs::SmallRng::from_entropy(); // Fast
-
-        let state = mcts::GameState {
-            next_player: player,
-            num_players,
-            board: self.clone(),
-        };
-
-        let think_time = 1.0;
-        let mut mcts = mcts::Mcts::new(state);
-        let start = now_sec();
-        while {
-            mcts.iterate(&mut rng);
-            now_sec() - start < think_time
-        } {}
-
-        let action = mcts.best_action().cloned();
-
-        if let Some(action) = action {
-            match action {
-                mcts::Action::Pass => None,
-                mcts::Action::Move(coord) => Some(coord),
-            }
-        } else {
-            None
-        }
-    }
 }
